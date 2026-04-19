@@ -9,6 +9,12 @@ import yfinance as yf
 
 
 # -------------------------------
+# Settings
+# -------------------------------
+RISK_PER_TRADE = 50.0  # edit this to whatever fixed risk you want per trade
+
+
+# -------------------------------
 # Watchlist (Trading 212 tickers)
 # -------------------------------
 WATCHLIST: Dict[str, str] = {
@@ -39,6 +45,9 @@ class SignalResult:
     exit_trigger: bool
     status: str
     pct_change_from_yesterday: float
+    risk_per_share: float | None
+    position_size: int | None
+    capital_required: float | None
 
 
 # -------------------------------
@@ -116,6 +125,24 @@ def compute_channels(name: str, df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def calculate_position_size(close: float, prior_20_low: float, status: str) -> tuple[float | None, int | None, float | None]:
+    if status != "BUY":
+        return None, None, None
+
+    risk_per_share = close - prior_20_low
+
+    if risk_per_share <= 0:
+        return None, None, None
+
+    position_size = math.floor(RISK_PER_TRADE / risk_per_share)
+
+    if position_size <= 0:
+        return risk_per_share, 0, 0.0
+
+    capital_required = position_size * close
+    return risk_per_share, position_size, capital_required
+
+
 def get_signal(name: str, symbol: str) -> SignalResult:
     df = download_ohlc(symbol)
     df = apply_symbol_fixes(name, symbol, df)
@@ -148,6 +175,12 @@ def get_signal(name: str, symbol: str) -> SignalResult:
     else:
         status = "HOLD"
 
+    risk_per_share, position_size, capital_required = calculate_position_size(
+        close=close,
+        prior_20_low=prior_20_low,
+        status=status,
+    )
+
     return SignalResult(
         name=name,
         symbol=symbol,
@@ -160,6 +193,9 @@ def get_signal(name: str, symbol: str) -> SignalResult:
         exit_trigger=exit_trigger,
         status=status,
         pct_change_from_yesterday=pct_change_from_yesterday,
+        risk_per_share=risk_per_share,
+        position_size=position_size,
+        capital_required=capital_required,
     )
 
 
@@ -192,6 +228,9 @@ def run_watchlist(watchlist: Dict[str, str]) -> tuple[pd.DataFrame, List[tuple[s
             "pct_to_breakout",
             "pct_to_sale",
             "pct_change_from_yesterday",
+            "risk_per_share",
+            "position_size",
+            "capital_required",
             "status",
         ]
     ].sort_values(by=["status", "pct_to_breakout"], ascending=[True, True])
@@ -209,11 +248,22 @@ def format_for_display(df: pd.DataFrame) -> pd.DataFrame:
 
     formatted = df.copy()
 
-    for col in ["close", "prior_50_high", "prior_20_low"]:
-        formatted[col] = formatted[col].map(lambda x: f"{float(x):,.2f}")
+    for col in ["close", "prior_50_high", "prior_20_low", "risk_per_share", "capital_required"]:
+        if col in formatted.columns:
+            formatted[col] = formatted[col].map(
+                lambda x: f"{float(x):,.2f}" if pd.notna(x) else ""
+            )
 
     for col in ["pct_to_breakout", "pct_to_sale", "pct_change_from_yesterday"]:
-        formatted[col] = formatted[col].map(lambda x: f"{float(x):.2f}%" if pd.notna(x) else "")
+        if col in formatted.columns:
+            formatted[col] = formatted[col].map(
+                lambda x: f"{float(x):.2f}%" if pd.notna(x) else ""
+            )
+
+    if "position_size" in formatted.columns:
+        formatted["position_size"] = formatted["position_size"].map(
+            lambda x: f"{int(x):,}" if pd.notna(x) else ""
+        )
 
     return formatted
 
@@ -243,6 +293,9 @@ def build_summary_html(df: pd.DataFrame, errors: List[tuple[str, str, str]]) -> 
         </div>
         <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #e2e3e5; color: #383d41; border: 1px solid #d6d8db; font-weight: bold;">
             ERRORS: {error_count}
+        </div>
+        <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #e9ecef; color: #212529; border: 1px solid #ced4da; font-weight: bold;">
+            RISK / TRADE: {RISK_PER_TRADE:,.2f}
         </div>
     </div>
     """
@@ -279,6 +332,9 @@ def build_actionable_html(df: pd.DataFrame) -> str:
             <td style="padding:10px; border:1px solid #ddd;">{row['name']}</td>
             <td style="padding:10px; border:1px solid #ddd;">{row['symbol']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['close']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['risk_per_share']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['position_size']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['capital_required']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right; background:{status_bg}; color:{status_color}; font-weight:bold;">
                 {status}
             </td>
@@ -293,6 +349,9 @@ def build_actionable_html(df: pd.DataFrame) -> str:
                 <th style="padding:10px; border:1px solid #ddd; text-align:left;">Name</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:left;">Symbol</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Close</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Risk / Share</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Position Size</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Capital Required</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Status</th>
             </tr>
         </thead>
@@ -336,6 +395,9 @@ def build_full_table_html(df: pd.DataFrame) -> str:
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['pct_to_breakout']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['pct_to_sale']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['pct_change_from_yesterday']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['risk_per_share']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['position_size']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['capital_required']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right; background:{status_bg}; color:{status_color}; font-weight:bold;">
                 {status}
             </td>
@@ -355,6 +417,9 @@ def build_full_table_html(df: pd.DataFrame) -> str:
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">% to Breakout</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">% to Sale</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">% Change</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Risk / Share</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Position Size</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Capital Required</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Status</th>
             </tr>
         </thead>
@@ -371,9 +436,7 @@ def build_errors_html(errors: List[tuple[str, str, str]]) -> str:
 
     items = []
     for name, symbol, msg in errors:
-        items.append(
-            f"<li><strong>{name}</strong> ({symbol}): {msg}</li>"
-        )
+        items.append(f"<li><strong>{name}</strong> ({symbol}): {msg}</li>")
 
     return f"""
     <h3 style="margin: 24px 0 12px 0;">Errors</h3>
@@ -392,9 +455,9 @@ def build_html_email(df: pd.DataFrame, errors: List[tuple[str, str, str]]) -> st
     return f"""
     <html>
     <body style="font-family: Arial, sans-serif; color: #222; margin: 0; padding: 24px; background: #f7f7f7;">
-        <div style="max-width: 1100px; margin: 0 auto; background: #ffffff; padding: 24px; border: 1px solid #e5e5e5;">
+        <div style="max-width: 1200px; margin: 0 auto; background: #ffffff; padding: 24px; border: 1px solid #e5e5e5;">
             <h2 style="margin-top: 0;">Daily Market Check</h2>
-            <p style="margin: 0 0 18px 0;">Donchian 50 / 20 watchlist scan.</p>
+            <p style="margin: 0 0 18px 0;">Donchian 50 / 20 watchlist scan with position sizing.</p>
 
             {summary_html}
             {actionable_html}
@@ -414,7 +477,7 @@ def main() -> None:
     signals_df, errors = run_watchlist(WATCHLIST)
 
     print("Daily Market Check")
-    print("=" * 80)
+    print("=" * 100)
 
     if signals_df.empty:
         print("No signals returned.")
