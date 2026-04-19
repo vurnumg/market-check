@@ -31,11 +31,11 @@ WATCHLIST: Dict[str, str] = {
 # Tickers that should use CLOSE-based channels
 CLOSE_ONLY = {"SGLN"}
 
-# Tickers quoted in pence on Yahoo / LSE and therefore need /100 for £ sizing
-PENCE_QUOTED = {"CUKX", "EMIM", "CU31", "SGLN"}
+# Tickers quoted in pence on Yahoo / LSE and therefore need /100 for £ sizing and P&L sizing
+PENCE_QUOTED = {"VUAG", "CUKX", "EMIM", "CU31", "IGLT"}
 
-# Tickers quoted in dollars and should NOT be divided by 100 for sizing
-DIRECT_QUOTED = {"VUAG", "IGLT","GBUS", "CMOD"}
+# Tickers quoted directly and should NOT be divided by 100
+DIRECT_QUOTED = {"GBUS", "CMOD", "SGLN"}
 
 
 @dataclass
@@ -133,7 +133,7 @@ def compute_channels(name: str, df: pd.DataFrame) -> pd.DataFrame:
 
 def convert_to_sizing_currency(name: str, value: float) -> float:
     """
-    Converts displayed market price into the unit used for £ risk sizing.
+    Converts displayed market price into the unit used for £ risk sizing and portfolio £ calculations.
     Pence-quoted instruments are divided by 100.
     Direct-quoted instruments are left unchanged.
     """
@@ -265,6 +265,84 @@ def run_watchlist(watchlist: Dict[str, str]) -> tuple[pd.DataFrame, List[tuple[s
 
 
 # -------------------------------
+# Portfolio
+# -------------------------------
+
+def load_portfolio() -> pd.DataFrame:
+    try:
+        df = pd.read_csv("portfolio.csv")
+    except FileNotFoundError:
+        return pd.DataFrame()
+
+    required = {"symbol", "name", "entry_price", "position_size", "entry_date"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"portfolio.csv is missing columns: {sorted(missing)}")
+
+    df = df.copy()
+    df["entry_price"] = pd.to_numeric(df["entry_price"], errors="coerce")
+    df["position_size"] = pd.to_numeric(df["position_size"], errors="coerce")
+    df["entry_date"] = df["entry_date"].astype(str)
+
+    df = df.dropna(subset=["symbol", "name", "entry_price", "position_size"])
+
+    return df
+
+
+def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) -> pd.DataFrame:
+    if portfolio.empty or signals.empty:
+        return pd.DataFrame()
+
+    current_prices = signals[["symbol", "name", "close", "prior_20_low", "status"]].copy()
+
+    merged = portfolio.merge(current_prices, on=["symbol", "name"], how="left")
+
+    if merged.empty:
+        return pd.DataFrame()
+
+    merged["entry_price_display"] = merged["entry_price"].astype(float)
+    merged["current_price_display"] = pd.to_numeric(merged["close"], errors="coerce")
+
+    merged["entry_price_calc"] = merged.apply(
+        lambda row: convert_to_sizing_currency(row["name"], float(row["entry_price_display"])),
+        axis=1,
+    )
+
+    merged["current_price_calc"] = merged.apply(
+        lambda row: convert_to_sizing_currency(row["name"], float(row["current_price_display"]))
+        if pd.notna(row["current_price_display"]) else float("nan"),
+        axis=1,
+    )
+
+    merged["position_size"] = merged["position_size"].astype(float)
+
+    merged["pnl_per_share"] = merged["current_price_calc"] - merged["entry_price_calc"]
+    merged["pnl_total"] = merged["pnl_per_share"] * merged["position_size"]
+    merged["pnl_pct"] = (merged["pnl_per_share"] / merged["entry_price_calc"]) * 100
+
+    merged["market_value"] = merged["current_price_calc"] * merged["position_size"]
+    merged["cost_basis"] = merged["entry_price_calc"] * merged["position_size"]
+
+    merged["exit_signal"] = merged["status"].apply(lambda x: "SELL" if x == "SELL" else "")
+
+    return merged[
+        [
+            "symbol",
+            "name",
+            "entry_date",
+            "entry_price_display",
+            "current_price_display",
+            "position_size",
+            "market_value",
+            "cost_basis",
+            "pnl_total",
+            "pnl_pct",
+            "exit_signal",
+        ]
+    ]
+
+
+# -------------------------------
 # Formatting helpers
 # -------------------------------
 
@@ -300,7 +378,38 @@ def format_for_display(df: pd.DataFrame) -> pd.DataFrame:
     return formatted
 
 
-def build_summary_html(df: pd.DataFrame, errors: List[tuple[str, str, str]]) -> str:
+def format_portfolio_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+
+    formatted = df.copy()
+
+    for col in ["entry_price_display", "current_price_display"]:
+        formatted[col] = formatted[col].map(
+            lambda x: f"{float(x):,.2f}" if pd.notna(x) else ""
+        )
+
+    for col in ["market_value", "cost_basis", "pnl_total"]:
+        formatted[col] = formatted[col].map(
+            lambda x: f"{float(x):,.2f}" if pd.notna(x) else ""
+        )
+
+    formatted["pnl_pct"] = formatted["pnl_pct"].map(
+        lambda x: f"{float(x):.2f}%" if pd.notna(x) else ""
+    )
+
+    formatted["position_size"] = formatted["position_size"].map(
+        lambda x: f"{int(x):,}" if pd.notna(x) else ""
+    )
+
+    return formatted
+
+
+def build_summary_html(
+    df: pd.DataFrame,
+    errors: List[tuple[str, str, str]],
+    portfolio_df: pd.DataFrame
+) -> str:
     buy_count = 0
     sell_count = 0
     hold_count = 0
@@ -311,6 +420,18 @@ def build_summary_html(df: pd.DataFrame, errors: List[tuple[str, str, str]]) -> 
         hold_count = int((df["status"] == "HOLD").sum())
 
     error_count = len(errors)
+
+    total_market_value = 0.0
+    total_pnl = 0.0
+    open_positions = 0
+
+    if not portfolio_df.empty:
+        total_market_value = float(portfolio_df["market_value"].sum())
+        total_pnl = float(portfolio_df["pnl_total"].sum())
+        open_positions = len(portfolio_df)
+
+    pnl_bg = "#d4edda" if total_pnl >= 0 else "#f8d7da"
+    pnl_color = "#155724" if total_pnl >= 0 else "#721c24"
 
     return f"""
     <div style="margin-bottom: 20px;">
@@ -328,6 +449,15 @@ def build_summary_html(df: pd.DataFrame, errors: List[tuple[str, str, str]]) -> 
         </div>
         <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #e9ecef; color: #212529; border: 1px solid #ced4da; font-weight: bold;">
             RISK / TRADE: £{RISK_PER_TRADE:,.2f}
+        </div>
+        <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #e9ecef; color: #212529; border: 1px solid #ced4da; font-weight: bold;">
+            OPEN POSITIONS: {open_positions}
+        </div>
+        <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #e9ecef; color: #212529; border: 1px solid #ced4da; font-weight: bold;">
+            PORTFOLIO VALUE: £{total_market_value:,.2f}
+        </div>
+        <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: {pnl_bg}; color: {pnl_color}; border: 1px solid #ced4da; font-weight: bold;">
+            TOTAL P&amp;L: £{total_pnl:,.2f}
         </div>
     </div>
     """
@@ -385,6 +515,69 @@ def build_actionable_html(df: pd.DataFrame) -> str:
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Position Size</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Capital Required</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Status</th>
+            </tr>
+        </thead>
+        <tbody>
+            {''.join(rows)}
+        </tbody>
+    </table>
+    """
+
+
+def build_portfolio_html(portfolio_df: pd.DataFrame) -> str:
+    if portfolio_df.empty:
+        return """
+        <h3 style="margin: 0 0 12px 0;">Portfolio</h3>
+        <p style="margin: 0 0 24px 0;">No active positions in portfolio.csv.</p>
+        """
+
+    formatted = format_portfolio_for_display(portfolio_df)
+
+    rows = []
+    for _, row in formatted.iterrows():
+        pnl_value_raw = portfolio_df.loc[portfolio_df.index[formatted.index.get_loc(_)], "pnl_total"] if False else None
+
+    for idx, row in formatted.iterrows():
+        raw_pnl = float(portfolio_df.loc[idx, "pnl_total"])
+        pnl_bg = "#d4edda" if raw_pnl >= 0 else "#f8d7da"
+        pnl_color = "#155724" if raw_pnl >= 0 else "#721c24"
+
+        exit_signal = row["exit_signal"]
+        exit_bg = "#f8d7da" if exit_signal == "SELL" else "#ffffff"
+        exit_color = "#721c24" if exit_signal == "SELL" else "#222222"
+
+        rows.append(f"""
+        <tr>
+            <td style="padding:10px; border:1px solid #ddd;">{row['name']}</td>
+            <td style="padding:10px; border:1px solid #ddd;">{row['symbol']}</td>
+            <td style="padding:10px; border:1px solid #ddd;">{row['entry_date']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['entry_price_display']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['current_price_display']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['position_size']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['cost_basis']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['market_value']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right; background:{pnl_bg}; color:{pnl_color}; font-weight:bold;">{row['pnl_total']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right; background:{pnl_bg}; color:{pnl_color}; font-weight:bold;">{row['pnl_pct']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:center; background:{exit_bg}; color:{exit_color}; font-weight:bold;">{exit_signal}</td>
+        </tr>
+        """)
+
+    return f"""
+    <h3 style="margin: 0 0 12px 0;">Portfolio</h3>
+    <table style="border-collapse: collapse; width: 100%; font-size: 14px; margin-bottom: 24px;">
+        <thead>
+            <tr style="background: #060B69; color: #ffffff;">
+                <th style="padding:10px; border:1px solid #ddd; text-align:left;">Name</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:left;">Symbol</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:left;">Entry Date</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Entry Price</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Current Price</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Size</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Cost Basis</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Market Value</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">P&amp;L</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">P&amp;L %</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:center;">Exit Signal</th>
             </tr>
         </thead>
         <tbody>
@@ -478,21 +671,27 @@ def build_errors_html(errors: List[tuple[str, str, str]]) -> str:
     """
 
 
-def build_html_email(df: pd.DataFrame, errors: List[tuple[str, str, str]]) -> str:
-    summary_html = build_summary_html(df, errors)
+def build_html_email(
+    df: pd.DataFrame,
+    errors: List[tuple[str, str, str]],
+    portfolio_df: pd.DataFrame
+) -> str:
+    summary_html = build_summary_html(df, errors, portfolio_df)
     actionable_html = build_actionable_html(df)
+    portfolio_html = build_portfolio_html(portfolio_df)
     full_table_html = build_full_table_html(df)
     errors_html = build_errors_html(errors)
 
     return f"""
     <html>
     <body style="font-family: Arial, sans-serif; color: #222; margin: 0; padding: 24px; background: #f7f7f7;">
-        <div style="max-width: 1200px; margin: 0 auto; background: #ffffff; padding: 24px; border: 1px solid #e5e5e5;">
+        <div style="max-width: 1400px; margin: 0 auto; background: #ffffff; padding: 24px; border: 1px solid #e5e5e5;">
             <h2 style="margin-top: 0;">Daily Market Check</h2>
-            <p style="margin: 0 0 18px 0;">Donchian 50 / 20 watchlist scan with position sizing.</p>
+            <p style="margin: 0 0 18px 0;">Donchian 50 / 20 watchlist scan with position sizing and portfolio tracking.</p>
 
             {summary_html}
             {actionable_html}
+            {portfolio_html}
             {full_table_html}
             {errors_html}
         </div>
@@ -507,6 +706,8 @@ def build_html_email(df: pd.DataFrame, errors: List[tuple[str, str, str]]) -> st
 
 def main() -> None:
     signals_df, errors = run_watchlist(WATCHLIST)
+    portfolio_input_df = load_portfolio()
+    portfolio_metrics_df = calculate_portfolio_metrics(portfolio_input_df, signals_df)
 
     print("Daily Market Check")
     print("=" * 100)
@@ -514,14 +715,22 @@ def main() -> None:
     if signals_df.empty:
         print("No signals returned.")
     else:
+        print("\nSignals")
         print(format_for_display(signals_df).to_string(index=False))
+
+    if not portfolio_metrics_df.empty:
+        print("\nPortfolio")
+        print(format_portfolio_for_display(portfolio_metrics_df).to_string(index=False))
+    else:
+        print("\nPortfolio")
+        print("No active positions in portfolio.csv.")
 
     if errors:
         print("\nErrors:")
         for name, symbol, msg in errors:
             print(f"- {name} ({symbol}): {msg}")
 
-    html = build_html_email(signals_df, errors)
+    html = build_html_email(signals_df, errors, portfolio_metrics_df)
 
     with open("market_email.html", "w", encoding="utf-8") as f:
         f.write(html)
