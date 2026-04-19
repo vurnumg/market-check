@@ -11,7 +11,7 @@ import yfinance as yf
 # -------------------------------
 # Settings
 # -------------------------------
-RISK_PER_TRADE = 50.0  # edit this to whatever fixed risk you want per trade
+RISK_PER_TRADE = 50.0  # Fixed £ risk per trade
 
 
 # -------------------------------
@@ -30,6 +30,12 @@ WATCHLIST: Dict[str, str] = {
 
 # Tickers that should use CLOSE-based channels
 CLOSE_ONLY = {"SGLN"}
+
+# Tickers quoted in pence on Yahoo / LSE and therefore need /100 for £ sizing
+PENCE_QUOTED = {"CUKX", "EMIM", "CU31", "SGLN"}
+
+# Tickers quoted in dollars and should NOT be divided by 100 for sizing
+DIRECT_QUOTED = {"VUAG", "IGLT","GBUS", "CMOD"}
 
 
 @dataclass
@@ -94,7 +100,7 @@ def apply_symbol_fixes(name: str, symbol: str, df: pd.DataFrame) -> pd.DataFrame
     df = df.copy()
 
     # GBUS Yahoo anomaly fix:
-    # Sometimes only the latest close is shown in pence rather than pounds
+    # Sometimes only the latest close is shown in pence rather than dollars
     if symbol == "GBUS.L":
         last_close = df.iloc[-1]["Close"]
         recent_closes = df["Close"].iloc[-10:-1]
@@ -125,11 +131,30 @@ def compute_channels(name: str, df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def calculate_position_size(close: float, prior_20_low: float, status: str) -> tuple[float | None, int | None, float | None]:
+def convert_to_sizing_currency(name: str, value: float) -> float:
+    """
+    Converts displayed market price into the unit used for £ risk sizing.
+    Pence-quoted instruments are divided by 100.
+    Direct-quoted instruments are left unchanged.
+    """
+    if name in PENCE_QUOTED:
+        return value / 100.0
+    return value
+
+
+def calculate_position_size(
+    name: str,
+    close: float,
+    prior_20_low: float,
+    status: str
+) -> tuple[float | None, int | None, float | None]:
     if status != "BUY":
         return None, None, None
 
-    risk_per_share = close - prior_20_low
+    close_for_sizing = convert_to_sizing_currency(name, close)
+    stop_for_sizing = convert_to_sizing_currency(name, prior_20_low)
+
+    risk_per_share = close_for_sizing - stop_for_sizing
 
     if risk_per_share <= 0:
         return None, None, None
@@ -139,7 +164,7 @@ def calculate_position_size(close: float, prior_20_low: float, status: str) -> t
     if position_size <= 0:
         return risk_per_share, 0, 0.0
 
-    capital_required = position_size * close
+    capital_required = position_size * close_for_sizing
     return risk_per_share, position_size, capital_required
 
 
@@ -176,6 +201,7 @@ def get_signal(name: str, symbol: str) -> SignalResult:
         status = "HOLD"
 
     risk_per_share, position_size, capital_required = calculate_position_size(
+        name=name,
         close=close,
         prior_20_low=prior_20_low,
         status=status,
@@ -248,7 +274,13 @@ def format_for_display(df: pd.DataFrame) -> pd.DataFrame:
 
     formatted = df.copy()
 
-    for col in ["close", "prior_50_high", "prior_20_low", "risk_per_share", "capital_required"]:
+    for col in ["close", "prior_50_high", "prior_20_low"]:
+        if col in formatted.columns:
+            formatted[col] = formatted[col].map(
+                lambda x: f"{float(x):,.2f}" if pd.notna(x) else ""
+            )
+
+    for col in ["risk_per_share", "capital_required"]:
         if col in formatted.columns:
             formatted[col] = formatted[col].map(
                 lambda x: f"{float(x):,.2f}" if pd.notna(x) else ""
@@ -295,7 +327,7 @@ def build_summary_html(df: pd.DataFrame, errors: List[tuple[str, str, str]]) -> 
             ERRORS: {error_count}
         </div>
         <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #e9ecef; color: #212529; border: 1px solid #ced4da; font-weight: bold;">
-            RISK / TRADE: {RISK_PER_TRADE:,.2f}
+            RISK / TRADE: £{RISK_PER_TRADE:,.2f}
         </div>
     </div>
     """
