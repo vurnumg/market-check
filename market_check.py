@@ -13,6 +13,20 @@ import yfinance as yf
 # -------------------------------
 RISK_PER_TRADE = 50.0  # Fixed £ risk per trade
 
+# Price scale used for sizing and portfolio valuation
+# 1.0  = use price as-is
+# 0.01 = divide by 100 because Yahoo price is effectively in pence for cash calcs
+PRICE_SCALE = {
+    "VUAG": 1.0,
+    "CUKX": 0.01,
+    "EMIM": 0.01,
+    "CU31": 0.01,
+    "IGLT": 1.0,
+    "GBUS": 1.0,
+    "CMOD": 1.0,
+    "SGLN": 0.01,
+}
+
 
 # -------------------------------
 # Watchlist (Trading 212 tickers)
@@ -30,12 +44,6 @@ WATCHLIST: Dict[str, str] = {
 
 # Tickers that should use CLOSE-based channels
 CLOSE_ONLY = {"SGLN"}
-
-# Tickers quoted in pence on Yahoo / LSE and therefore need /100 for £ sizing and P&L sizing
-PENCE_QUOTED = {"VUAG", "CUKX", "EMIM", "CU31", "IGLT"}
-
-# Tickers quoted directly and should NOT be divided by 100
-DIRECT_QUOTED = {"GBUS", "CMOD", "SGLN"}
 
 
 @dataclass
@@ -131,15 +139,16 @@ def compute_channels(name: str, df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def convert_to_sizing_currency(name: str, value: float) -> float:
+def convert_price_for_cash_calcs(name: str, value: float) -> float:
     """
-    Converts displayed market price into the unit used for £ risk sizing and portfolio £ calculations.
-    Pence-quoted instruments are divided by 100.
-    Direct-quoted instruments are left unchanged.
+    Converts a displayed market price into the cash value used for:
+    - position sizing
+    - cost basis
+    - market value
+    - P&L
     """
-    if name in PENCE_QUOTED:
-        return value / 100.0
-    return value
+    scale = PRICE_SCALE.get(name, 1.0)
+    return value * scale
 
 
 def calculate_position_size(
@@ -151,8 +160,8 @@ def calculate_position_size(
     if status != "BUY":
         return None, None, None
 
-    close_for_sizing = convert_to_sizing_currency(name, close)
-    stop_for_sizing = convert_to_sizing_currency(name, prior_20_low)
+    close_for_sizing = convert_price_for_cash_calcs(name, close)
+    stop_for_sizing = convert_price_for_cash_calcs(name, prior_20_low)
 
     risk_per_share = close_for_sizing - stop_for_sizing
 
@@ -293,8 +302,7 @@ def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) 
     if portfolio.empty or signals.empty:
         return pd.DataFrame()
 
-    current_prices = signals[["symbol", "name", "close", "prior_20_low", "status"]].copy()
-
+    current_prices = signals[["symbol", "name", "close", "status"]].copy()
     merged = portfolio.merge(current_prices, on=["symbol", "name"], how="left")
 
     if merged.empty:
@@ -302,26 +310,25 @@ def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) 
 
     merged["entry_price_display"] = merged["entry_price"].astype(float)
     merged["current_price_display"] = pd.to_numeric(merged["close"], errors="coerce")
+    merged["position_size"] = pd.to_numeric(merged["position_size"], errors="coerce")
 
     merged["entry_price_calc"] = merged.apply(
-        lambda row: convert_to_sizing_currency(row["name"], float(row["entry_price_display"])),
+        lambda row: convert_price_for_cash_calcs(row["name"], float(row["entry_price_display"])),
         axis=1,
     )
 
     merged["current_price_calc"] = merged.apply(
-        lambda row: convert_to_sizing_currency(row["name"], float(row["current_price_display"]))
+        lambda row: convert_price_for_cash_calcs(row["name"], float(row["current_price_display"]))
         if pd.notna(row["current_price_display"]) else float("nan"),
         axis=1,
     )
-
-    merged["position_size"] = merged["position_size"].astype(float)
 
     merged["pnl_per_share"] = merged["current_price_calc"] - merged["entry_price_calc"]
     merged["pnl_total"] = merged["pnl_per_share"] * merged["position_size"]
     merged["pnl_pct"] = (merged["pnl_per_share"] / merged["entry_price_calc"]) * 100
 
-    merged["market_value"] = merged["current_price_calc"] * merged["position_size"]
-    merged["cost_basis"] = merged["entry_price_calc"] * merged["position_size"]
+    merged["cost_basis"] = merged["entry_price_display"] * merged["position_size"]
+    merged["market_value"] = merged["current_price_display"] * merged["position_size"]
 
     merged["exit_signal"] = merged["status"].apply(lambda x: "SELL" if x == "SELL" else "")
 
@@ -333,8 +340,8 @@ def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) 
             "entry_price_display",
             "current_price_display",
             "position_size",
-            "market_value",
             "cost_basis",
+            "market_value",
             "pnl_total",
             "pnl_pct",
             "exit_signal",
@@ -384,12 +391,7 @@ def format_portfolio_for_display(df: pd.DataFrame) -> pd.DataFrame:
 
     formatted = df.copy()
 
-    for col in ["entry_price_display", "current_price_display"]:
-        formatted[col] = formatted[col].map(
-            lambda x: f"{float(x):,.2f}" if pd.notna(x) else ""
-        )
-
-    for col in ["market_value", "cost_basis", "pnl_total"]:
+    for col in ["entry_price_display", "current_price_display", "cost_basis", "market_value", "pnl_total"]:
         formatted[col] = formatted[col].map(
             lambda x: f"{float(x):,.2f}" if pd.notna(x) else ""
         )
@@ -534,9 +536,6 @@ def build_portfolio_html(portfolio_df: pd.DataFrame) -> str:
     formatted = format_portfolio_for_display(portfolio_df)
 
     rows = []
-    for _, row in formatted.iterrows():
-        pnl_value_raw = portfolio_df.loc[portfolio_df.index[formatted.index.get_loc(_)], "pnl_total"] if False else None
-
     for idx, row in formatted.iterrows():
         raw_pnl = float(portfolio_df.loc[idx, "pnl_total"])
         pnl_bg = "#d4edda" if raw_pnl >= 0 else "#f8d7da"
@@ -573,8 +572,8 @@ def build_portfolio_html(portfolio_df: pd.DataFrame) -> str:
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Entry Price</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Current Price</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Size</th>
-                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Cost Basis</th>
-                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Market Value</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Entry Value</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Current Value</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">P&amp;L</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">P&amp;L %</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:center;">Exit Signal</th>
