@@ -24,7 +24,7 @@ PRICE_SCALE = {
     "IGLT": 1.0,
     "GBUS": 1.0,
     "CMOD": 1.0,
-    "SGLN": 0.01,
+    "SGLN": 1.0,
 }
 
 
@@ -143,8 +143,8 @@ def convert_price_for_cash_calcs(name: str, value: float) -> float:
     """
     Converts a displayed market price into the cash value used for:
     - position sizing
-    - cost basis
-    - market value
+    - entry value
+    - current value
     - P&L
     """
     scale = PRICE_SCALE.get(name, 1.0)
@@ -327,8 +327,8 @@ def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) 
     merged["pnl_total"] = merged["pnl_per_share"] * merged["position_size"]
     merged["pnl_pct"] = (merged["pnl_per_share"] / merged["entry_price_calc"]) * 100
 
-    merged["cost_basis"] = merged["entry_price_display"] * merged["position_size"]
-    merged["market_value"] = merged["current_price_display"] * merged["position_size"]
+    merged["entry_value"] = merged["entry_price_calc"] * merged["position_size"]
+    merged["current_value"] = merged["current_price_calc"] * merged["position_size"]
 
     merged["exit_signal"] = merged["status"].apply(lambda x: "SELL" if x == "SELL" else "")
 
@@ -340,8 +340,8 @@ def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) 
             "entry_price_display",
             "current_price_display",
             "position_size",
-            "cost_basis",
-            "market_value",
+            "entry_value",
+            "current_value",
             "pnl_total",
             "pnl_pct",
             "exit_signal",
@@ -391,9 +391,16 @@ def format_portfolio_for_display(df: pd.DataFrame) -> pd.DataFrame:
 
     formatted = df.copy()
 
-    for col in ["entry_price_display", "current_price_display", "cost_basis", "market_value", "pnl_total"]:
+    # Show actual quoted prices exactly as entered / downloaded
+    for col in ["entry_price_display", "current_price_display"]:
         formatted[col] = formatted[col].map(
             lambda x: f"{float(x):,.2f}" if pd.notna(x) else ""
+        )
+
+    # Show cash/value columns in pounds
+    for col in ["entry_value", "current_value", "pnl_total"]:
+        formatted[col] = formatted[col].map(
+            lambda x: f"£{float(x):,.2f}" if pd.notna(x) else ""
         )
 
     formatted["pnl_pct"] = formatted["pnl_pct"].map(
@@ -405,7 +412,6 @@ def format_portfolio_for_display(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     return formatted
-
 
 def build_summary_html(
     df: pd.DataFrame,
@@ -423,12 +429,12 @@ def build_summary_html(
 
     error_count = len(errors)
 
-    total_market_value = 0.0
+    total_current_value = 0.0
     total_pnl = 0.0
     open_positions = 0
 
     if not portfolio_df.empty:
-        total_market_value = float(portfolio_df["market_value"].sum())
+        total_current_value = float(portfolio_df["current_value"].sum())
         total_pnl = float(portfolio_df["pnl_total"].sum())
         open_positions = len(portfolio_df)
 
@@ -456,7 +462,7 @@ def build_summary_html(
             OPEN POSITIONS: {open_positions}
         </div>
         <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #e9ecef; color: #212529; border: 1px solid #ced4da; font-weight: bold;">
-            PORTFOLIO VALUE: £{total_market_value:,.2f}
+            PORTFOLIO VALUE: £{total_current_value:,.2f}
         </div>
         <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: {pnl_bg}; color: {pnl_color}; border: 1px solid #ced4da; font-weight: bold;">
             TOTAL P&amp;L: £{total_pnl:,.2f}
@@ -553,8 +559,8 @@ def build_portfolio_html(portfolio_df: pd.DataFrame) -> str:
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['entry_price_display']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['current_price_display']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['position_size']}</td>
-            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['cost_basis']}</td>
-            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['market_value']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['entry_value']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['current_value']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right; background:{pnl_bg}; color:{pnl_color}; font-weight:bold;">{row['pnl_total']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right; background:{pnl_bg}; color:{pnl_color}; font-weight:bold;">{row['pnl_pct']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:center; background:{exit_bg}; color:{exit_color}; font-weight:bold;">{exit_signal}</td>
