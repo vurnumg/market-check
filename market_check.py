@@ -14,6 +14,7 @@ import yfinance as yf
 RISK_PER_TRADE = 50.0  # Fixed £ risk per trade
 PORTFOLIO_FILE = "portfolio.csv"
 UPDATED_PORTFOLIO_FILE = "portfolio_updated.csv"
+PRICE_DECIMALS = 2
 
 # Price scale used for sizing and portfolio valuation
 # 1.0  = use price as-is
@@ -64,6 +65,14 @@ class SignalResult:
     risk_per_share: float | None
     position_size: int | None
     capital_required: float | None
+
+
+# -------------------------------
+# Helpers
+# -------------------------------
+
+def normalise_price(value: float | int | None) -> float:
+    return round(float(value), PRICE_DECIMALS)
 
 
 # -------------------------------
@@ -138,6 +147,9 @@ def compute_channels(name: str, df: pd.DataFrame) -> pd.DataFrame:
         df["prior_50_high"] = df["High"].rolling(50).max().shift(1)
         df["prior_20_low"] = df["Low"].rolling(20).min().shift(1)
 
+    df["prior_50_high"] = df["prior_50_high"].round(PRICE_DECIMALS)
+    df["prior_20_low"] = df["prior_20_low"].round(PRICE_DECIMALS)
+
     return df
 
 
@@ -166,7 +178,7 @@ def calculate_position_size(
     close_for_sizing = convert_price_for_cash_calcs(name, close)
     stop_for_sizing = convert_price_for_cash_calcs(name, prior_20_low)
 
-    risk_per_share = close_for_sizing - stop_for_sizing
+    risk_per_share = normalise_price(close_for_sizing - stop_for_sizing)
 
     if risk_per_share <= 0:
         return None, None, None
@@ -176,7 +188,7 @@ def calculate_position_size(
     if position_size <= 0:
         return risk_per_share, 0, 0.0
 
-    capital_required = position_size * close_for_sizing
+    capital_required = normalise_price(position_size * close_for_sizing)
     return risk_per_share, position_size, capital_required
 
 
@@ -189,9 +201,9 @@ def get_signal(name: str, symbol: str) -> SignalResult:
 
     last = df.iloc[-1]
 
-    close = float(last["Close"])
-    prior_50_high = float(last["prior_50_high"])
-    prior_20_low = float(last["prior_20_low"])
+    close = normalise_price(last["Close"])
+    prior_50_high = normalise_price(last["prior_50_high"])
+    prior_20_low = normalise_price(last["prior_20_low"])
     pct_change_from_yesterday = (
         float(last["daily_pct_change"]) if pd.notna(last["daily_pct_change"]) else 0.0
     )
@@ -292,9 +304,9 @@ def load_portfolio() -> pd.DataFrame:
         raise ValueError(f"portfolio.csv is missing columns: {sorted(missing)}")
 
     df = df.copy()
-    df["entry_price"] = pd.to_numeric(df["entry_price"], errors="coerce")
+    df["entry_price"] = pd.to_numeric(df["entry_price"], errors="coerce").round(PRICE_DECIMALS)
     df["position_size"] = pd.to_numeric(df["position_size"], errors="coerce")
-    df["stop_price"] = pd.to_numeric(df["stop_price"], errors="coerce")
+    df["stop_price"] = pd.to_numeric(df["stop_price"], errors="coerce").round(PRICE_DECIMALS)
     df["entry_date"] = df["entry_date"].astype(str)
 
     df = df.dropna(subset=["symbol", "name", "entry_price", "position_size", "stop_price"])
@@ -312,14 +324,14 @@ def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) 
     if merged.empty:
         return pd.DataFrame(), portfolio.copy()
 
-    merged["entry_price_display"] = merged["entry_price"].astype(float)
-    merged["current_price_display"] = pd.to_numeric(merged["close"], errors="coerce")
+    merged["entry_price_display"] = pd.to_numeric(merged["entry_price"], errors="coerce").round(PRICE_DECIMALS)
+    merged["current_price_display"] = pd.to_numeric(merged["close"], errors="coerce").round(PRICE_DECIMALS)
     merged["position_size"] = pd.to_numeric(merged["position_size"], errors="coerce")
-    merged["stop_price_display"] = pd.to_numeric(merged["stop_price"], errors="coerce")
-    merged["today_d20_display"] = pd.to_numeric(merged["prior_20_low"], errors="coerce")
+    merged["stop_price_display"] = pd.to_numeric(merged["stop_price"], errors="coerce").round(PRICE_DECIMALS)
+    merged["today_d20_display"] = pd.to_numeric(merged["prior_20_low"], errors="coerce").round(PRICE_DECIMALS)
 
     merged["updated_stop_price_display"] = merged.apply(
-        lambda row: max(float(row["stop_price_display"]), float(row["today_d20_display"]))
+        lambda row: normalise_price(max(float(row["stop_price_display"]), float(row["today_d20_display"])))
         if pd.notna(row["stop_price_display"]) and pd.notna(row["today_d20_display"])
         else row["stop_price_display"],
         axis=1,
@@ -368,6 +380,9 @@ def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) 
     merged["current_value"] = merged["current_price_calc"] * merged["position_size"]
     merged["stop_value"] = merged["stop_price_calc"] * merged["position_size"]
 
+    value_cols = ["entry_value", "current_value", "stop_value", "pnl_total"]
+    merged[value_cols] = merged[value_cols].round(PRICE_DECIMALS)
+
     updated_portfolio = merged[
         ["symbol", "name", "entry_price", "position_size", "entry_date", "updated_stop_price_display"]
     ].rename(columns={"updated_stop_price_display": "stop_price"})
@@ -401,9 +416,9 @@ def save_updated_portfolio(updated_portfolio: pd.DataFrame) -> None:
         return
 
     output_df = updated_portfolio.copy()
-    output_df["entry_price"] = output_df["entry_price"].map(lambda x: f"{float(x):.2f}")
+    output_df["entry_price"] = output_df["entry_price"].map(lambda x: f"{float(x):.{PRICE_DECIMALS}f}")
     output_df["position_size"] = output_df["position_size"].map(lambda x: int(float(x)))
-    output_df["stop_price"] = output_df["stop_price"].map(lambda x: f"{float(x):.2f}")
+    output_df["stop_price"] = output_df["stop_price"].map(lambda x: f"{float(x):.{PRICE_DECIMALS}f}")
     output_df.to_csv(UPDATED_PORTFOLIO_FILE, index=False)
 
 
@@ -449,7 +464,6 @@ def format_portfolio_for_display(df: pd.DataFrame) -> pd.DataFrame:
 
     formatted = df.copy()
 
-    # Show actual quoted prices exactly as entered / downloaded
     for col in [
         "entry_price_display",
         "current_price_display",
@@ -462,7 +476,6 @@ def format_portfolio_for_display(df: pd.DataFrame) -> pd.DataFrame:
                 lambda x: f"{float(x):,.2f}" if pd.notna(x) else ""
             )
 
-    # Show cash/value columns in pounds
     for col in ["entry_value", "current_value", "stop_value", "pnl_total"]:
         if col in formatted.columns:
             formatted[col] = formatted[col].map(
