@@ -12,6 +12,8 @@ import yfinance as yf
 # Settings
 # -------------------------------
 RISK_PER_TRADE = 50.0  # Fixed £ risk per trade
+PORTFOLIO_FILE = "portfolio.csv"
+UPDATED_PORTFOLIO_FILE = "portfolio_updated.csv"
 
 # Price scale used for sizing and portfolio valuation
 # 1.0  = use price as-is
@@ -144,6 +146,7 @@ def convert_price_for_cash_calcs(name: str, value: float) -> float:
     Converts a displayed market price into the cash value used for:
     - position sizing
     - entry value
+    - stop value
     - current value
     - P&L
     """
@@ -279,11 +282,11 @@ def run_watchlist(watchlist: Dict[str, str]) -> tuple[pd.DataFrame, List[tuple[s
 
 def load_portfolio() -> pd.DataFrame:
     try:
-        df = pd.read_csv("portfolio.csv")
+        df = pd.read_csv(PORTFOLIO_FILE)
     except FileNotFoundError:
         return pd.DataFrame()
 
-    required = {"symbol", "name", "entry_price", "position_size", "entry_date"}
+    required = {"symbol", "name", "entry_price", "position_size", "entry_date", "stop_price"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"portfolio.csv is missing columns: {sorted(missing)}")
@@ -291,26 +294,54 @@ def load_portfolio() -> pd.DataFrame:
     df = df.copy()
     df["entry_price"] = pd.to_numeric(df["entry_price"], errors="coerce")
     df["position_size"] = pd.to_numeric(df["position_size"], errors="coerce")
+    df["stop_price"] = pd.to_numeric(df["stop_price"], errors="coerce")
     df["entry_date"] = df["entry_date"].astype(str)
 
-    df = df.dropna(subset=["symbol", "name", "entry_price", "position_size"])
+    df = df.dropna(subset=["symbol", "name", "entry_price", "position_size", "stop_price"])
 
     return df
 
 
-def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) -> pd.DataFrame:
+def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     if portfolio.empty or signals.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), portfolio.copy()
 
-    current_prices = signals[["symbol", "name", "close", "status"]].copy()
+    current_prices = signals[["symbol", "name", "close", "prior_20_low", "status"]].copy()
     merged = portfolio.merge(current_prices, on=["symbol", "name"], how="left")
 
     if merged.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), portfolio.copy()
 
     merged["entry_price_display"] = merged["entry_price"].astype(float)
     merged["current_price_display"] = pd.to_numeric(merged["close"], errors="coerce")
     merged["position_size"] = pd.to_numeric(merged["position_size"], errors="coerce")
+    merged["stop_price_display"] = pd.to_numeric(merged["stop_price"], errors="coerce")
+    merged["today_d20_display"] = pd.to_numeric(merged["prior_20_low"], errors="coerce")
+
+    merged["updated_stop_price_display"] = merged.apply(
+        lambda row: max(float(row["stop_price_display"]), float(row["today_d20_display"]))
+        if pd.notna(row["stop_price_display"]) and pd.notna(row["today_d20_display"])
+        else row["stop_price_display"],
+        axis=1,
+    )
+
+    merged["stop_moved"] = merged.apply(
+        lambda row: "RAISE STOP"
+        if pd.notna(row["updated_stop_price_display"])
+        and pd.notna(row["stop_price_display"])
+        and float(row["updated_stop_price_display"]) > float(row["stop_price_display"])
+        else "",
+        axis=1,
+    )
+
+    merged["exit_signal"] = merged.apply(
+        lambda row: "SELL"
+        if pd.notna(row["current_price_display"])
+        and pd.notna(row["updated_stop_price_display"])
+        and float(row["current_price_display"]) < float(row["updated_stop_price_display"])
+        else "",
+        axis=1,
+    )
 
     merged["entry_price_calc"] = merged.apply(
         lambda row: convert_price_for_cash_calcs(row["name"], float(row["entry_price_display"])),
@@ -323,16 +354,25 @@ def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) 
         axis=1,
     )
 
+    merged["stop_price_calc"] = merged.apply(
+        lambda row: convert_price_for_cash_calcs(row["name"], float(row["updated_stop_price_display"]))
+        if pd.notna(row["updated_stop_price_display"]) else float("nan"),
+        axis=1,
+    )
+
     merged["pnl_per_share"] = merged["current_price_calc"] - merged["entry_price_calc"]
     merged["pnl_total"] = merged["pnl_per_share"] * merged["position_size"]
     merged["pnl_pct"] = (merged["pnl_per_share"] / merged["entry_price_calc"]) * 100
 
     merged["entry_value"] = merged["entry_price_calc"] * merged["position_size"]
     merged["current_value"] = merged["current_price_calc"] * merged["position_size"]
+    merged["stop_value"] = merged["stop_price_calc"] * merged["position_size"]
 
-    merged["exit_signal"] = merged["status"].apply(lambda x: "SELL" if x == "SELL" else "")
+    updated_portfolio = merged[
+        ["symbol", "name", "entry_price", "position_size", "entry_date", "updated_stop_price_display"]
+    ].rename(columns={"updated_stop_price_display": "stop_price"})
 
-    return merged[
+    portfolio_metrics = merged[
         [
             "symbol",
             "name",
@@ -340,13 +380,31 @@ def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) 
             "entry_price_display",
             "current_price_display",
             "position_size",
+            "stop_price_display",
+            "today_d20_display",
+            "updated_stop_price_display",
             "entry_value",
             "current_value",
+            "stop_value",
             "pnl_total",
             "pnl_pct",
+            "stop_moved",
             "exit_signal",
         ]
-    ]
+    ].copy()
+
+    return portfolio_metrics, updated_portfolio
+
+
+def save_updated_portfolio(updated_portfolio: pd.DataFrame) -> None:
+    if updated_portfolio.empty:
+        return
+
+    output_df = updated_portfolio.copy()
+    output_df["entry_price"] = output_df["entry_price"].map(lambda x: f"{float(x):.2f}")
+    output_df["position_size"] = output_df["position_size"].map(lambda x: int(float(x)))
+    output_df["stop_price"] = output_df["stop_price"].map(lambda x: f"{float(x):.2f}")
+    output_df.to_csv(UPDATED_PORTFOLIO_FILE, index=False)
 
 
 # -------------------------------
@@ -392,26 +450,37 @@ def format_portfolio_for_display(df: pd.DataFrame) -> pd.DataFrame:
     formatted = df.copy()
 
     # Show actual quoted prices exactly as entered / downloaded
-    for col in ["entry_price_display", "current_price_display"]:
-        formatted[col] = formatted[col].map(
-            lambda x: f"{float(x):,.2f}" if pd.notna(x) else ""
-        )
+    for col in [
+        "entry_price_display",
+        "current_price_display",
+        "stop_price_display",
+        "today_d20_display",
+        "updated_stop_price_display",
+    ]:
+        if col in formatted.columns:
+            formatted[col] = formatted[col].map(
+                lambda x: f"{float(x):,.2f}" if pd.notna(x) else ""
+            )
 
     # Show cash/value columns in pounds
-    for col in ["entry_value", "current_value", "pnl_total"]:
-        formatted[col] = formatted[col].map(
-            lambda x: f"£{float(x):,.2f}" if pd.notna(x) else ""
+    for col in ["entry_value", "current_value", "stop_value", "pnl_total"]:
+        if col in formatted.columns:
+            formatted[col] = formatted[col].map(
+                lambda x: f"£{float(x):,.2f}" if pd.notna(x) else ""
+            )
+
+    if "pnl_pct" in formatted.columns:
+        formatted["pnl_pct"] = formatted["pnl_pct"].map(
+            lambda x: f"{float(x):.2f}%" if pd.notna(x) else ""
         )
 
-    formatted["pnl_pct"] = formatted["pnl_pct"].map(
-        lambda x: f"{float(x):.2f}%" if pd.notna(x) else ""
-    )
-
-    formatted["position_size"] = formatted["position_size"].map(
-        lambda x: f"{int(x):,}" if pd.notna(x) else ""
-    )
+    if "position_size" in formatted.columns:
+        formatted["position_size"] = formatted["position_size"].map(
+            lambda x: f"{int(x):,}" if pd.notna(x) else ""
+        )
 
     return formatted
+
 
 def build_summary_html(
     df: pd.DataFrame,
@@ -432,11 +501,15 @@ def build_summary_html(
     total_current_value = 0.0
     total_pnl = 0.0
     open_positions = 0
+    stop_raise_count = 0
+    exit_count = 0
 
     if not portfolio_df.empty:
         total_current_value = float(portfolio_df["current_value"].sum())
         total_pnl = float(portfolio_df["pnl_total"].sum())
         open_positions = len(portfolio_df)
+        stop_raise_count = int((portfolio_df["stop_moved"] == "RAISE STOP").sum())
+        exit_count = int((portfolio_df["exit_signal"] == "SELL").sum())
 
     pnl_bg = "#d4edda" if total_pnl >= 0 else "#f8d7da"
     pnl_color = "#155724" if total_pnl >= 0 else "#721c24"
@@ -460,6 +533,12 @@ def build_summary_html(
         </div>
         <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #e9ecef; color: #212529; border: 1px solid #ced4da; font-weight: bold;">
             OPEN POSITIONS: {open_positions}
+        </div>
+        <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #e9ecef; color: #212529; border: 1px solid #ced4da; font-weight: bold;">
+            STOPS RAISED: {stop_raise_count}
+        </div>
+        <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; font-weight: bold;">
+            PORTFOLIO SELLS: {exit_count}
         </div>
         <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #e9ecef; color: #212529; border: 1px solid #ced4da; font-weight: bold;">
             PORTFOLIO VALUE: £{total_current_value:,.2f}
@@ -502,6 +581,7 @@ def build_actionable_html(df: pd.DataFrame) -> str:
             <td style="padding:10px; border:1px solid #ddd;">{row['name']}</td>
             <td style="padding:10px; border:1px solid #ddd;">{row['symbol']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['close']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['prior_20_low']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['risk_per_share']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['position_size']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['capital_required']}</td>
@@ -519,6 +599,7 @@ def build_actionable_html(df: pd.DataFrame) -> str:
                 <th style="padding:10px; border:1px solid #ddd; text-align:left;">Name</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:left;">Symbol</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Close</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Initial / Current D20</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Risk / Share</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Position Size</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Capital Required</th>
@@ -547,6 +628,10 @@ def build_portfolio_html(portfolio_df: pd.DataFrame) -> str:
         pnl_bg = "#d4edda" if raw_pnl >= 0 else "#f8d7da"
         pnl_color = "#155724" if raw_pnl >= 0 else "#721c24"
 
+        stop_moved = row["stop_moved"]
+        stop_bg = "#d4edda" if stop_moved == "RAISE STOP" else "#ffffff"
+        stop_color = "#155724" if stop_moved == "RAISE STOP" else "#222222"
+
         exit_signal = row["exit_signal"]
         exit_bg = "#f8d7da" if exit_signal == "SELL" else "#ffffff"
         exit_color = "#721c24" if exit_signal == "SELL" else "#222222"
@@ -559,10 +644,15 @@ def build_portfolio_html(portfolio_df: pd.DataFrame) -> str:
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['entry_price_display']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['current_price_display']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['position_size']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['stop_price_display']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['today_d20_display']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['updated_stop_price_display']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['entry_value']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['current_value']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['stop_value']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right; background:{pnl_bg}; color:{pnl_color}; font-weight:bold;">{row['pnl_total']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right; background:{pnl_bg}; color:{pnl_color}; font-weight:bold;">{row['pnl_pct']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:center; background:{stop_bg}; color:{stop_color}; font-weight:bold;">{stop_moved}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:center; background:{exit_bg}; color:{exit_color}; font-weight:bold;">{exit_signal}</td>
         </tr>
         """)
@@ -578,10 +668,15 @@ def build_portfolio_html(portfolio_df: pd.DataFrame) -> str:
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Entry Price</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Current Price</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Size</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Stored Stop</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Today D20</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">New Stop</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Entry Value</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Current Value</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Stop Value</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">P&amp;L</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">P&amp;L %</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:center;">Stop Action</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:center;">Exit Signal</th>
             </tr>
         </thead>
@@ -690,9 +785,9 @@ def build_html_email(
     return f"""
     <html>
     <body style="font-family: Arial, sans-serif; color: #222; margin: 0; padding: 24px; background: #f7f7f7;">
-        <div style="max-width: 1400px; margin: 0 auto; background: #ffffff; padding: 24px; border: 1px solid #e5e5e5;">
+        <div style="max-width: 1600px; margin: 0 auto; background: #ffffff; padding: 24px; border: 1px solid #e5e5e5;">
             <h2 style="margin-top: 0;">Daily Market Check</h2>
-            <p style="margin: 0 0 18px 0;">Donchian 50 / 20 watchlist scan with position sizing and portfolio tracking.</p>
+            <p style="margin: 0 0 18px 0;">Donchian 50 / 20 watchlist scan with position sizing, trailing stop management and portfolio tracking.</p>
 
             {summary_html}
             {actionable_html}
@@ -712,10 +807,10 @@ def build_html_email(
 def main() -> None:
     signals_df, errors = run_watchlist(WATCHLIST)
     portfolio_input_df = load_portfolio()
-    portfolio_metrics_df = calculate_portfolio_metrics(portfolio_input_df, signals_df)
+    portfolio_metrics_df, updated_portfolio_df = calculate_portfolio_metrics(portfolio_input_df, signals_df)
 
     print("Daily Market Check")
-    print("=" * 100)
+    print("=" * 120)
 
     if signals_df.empty:
         print("No signals returned.")
@@ -726,6 +821,8 @@ def main() -> None:
     if not portfolio_metrics_df.empty:
         print("\nPortfolio")
         print(format_portfolio_for_display(portfolio_metrics_df).to_string(index=False))
+        save_updated_portfolio(updated_portfolio_df)
+        print(f"\nUpdated trailing stops written to {UPDATED_PORTFOLIO_FILE}")
     else:
         print("\nPortfolio")
         print("No active positions in portfolio.csv.")
