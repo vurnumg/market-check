@@ -634,11 +634,25 @@ def build_portfolio_html(portfolio_df: pd.DataFrame) -> str:
         <p style="margin: 0 0 24px 0;">No active positions in portfolio.csv.</p>
         """
 
-    formatted = format_portfolio_for_display(portfolio_df)
+    working_df = portfolio_df.copy()
+
+    # 50/20 live positions: score is % distance from D50 breakout
+    working_df["score_pct_raw"] = (
+        (working_df["current_price"] - working_df["prior_50_high"]) / working_df["prior_50_high"]
+    ) * 100
+
+    # Highest score gets rank 1
+    working_df["rank"] = (
+        working_df["score_pct_raw"]
+        .rank(ascending=False, method="dense")
+        .astype(int)
+    )
+
+    formatted = format_portfolio_for_display(working_df)
 
     rows = []
     for idx, row in formatted.iterrows():
-        raw_pnl = float(portfolio_df.loc[idx, "pnl_total"])
+        raw_pnl = float(working_df.loc[idx, "pnl_total"])
         pnl_bg = "#d4edda" if raw_pnl >= 0 else "#f8d7da"
         pnl_color = "#155724" if raw_pnl >= 0 else "#721c24"
 
@@ -649,6 +663,9 @@ def build_portfolio_html(portfolio_df: pd.DataFrame) -> str:
         exit_signal = row["exit_signal"]
         exit_bg = "#f8d7da" if exit_signal == "SELL" else "#ffffff"
         exit_color = "#721c24" if exit_signal == "SELL" else "#222222"
+
+        score_pct = f"{working_df.loc[idx, 'score_pct_raw']:.2f}%"
+        rank = int(working_df.loc[idx, "rank"])
 
         rows.append(f"""
         <tr>
@@ -661,9 +678,8 @@ def build_portfolio_html(portfolio_df: pd.DataFrame) -> str:
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['stop_price_display']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['today_d20_display']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['updated_stop_price_display']}</td>
-            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['entry_value']}</td>
-            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['current_value']}</td>
-            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['stop_value']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{score_pct}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{rank}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right; background:{pnl_bg}; color:{pnl_color}; font-weight:bold;">{row['pnl_total']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right; background:{pnl_bg}; color:{pnl_color}; font-weight:bold;">{row['pnl_pct']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:center; background:{stop_bg}; color:{stop_color}; font-weight:bold;">{stop_moved}</td>
@@ -685,9 +701,8 @@ def build_portfolio_html(portfolio_df: pd.DataFrame) -> str:
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Stored Stop</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">Today D20</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">New Stop</th>
-                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Entry Value</th>
-                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Current Value</th>
-                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Stop Value</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Score %</th>
+                <th style="padding:10px; border:1px solid #ddd; text-align:right;">Rank</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">P&amp;L</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:right;">P&amp;L %</th>
                 <th style="padding:10px; border:1px solid #ddd; text-align:center;">Stop Action</th>
@@ -699,7 +714,6 @@ def build_portfolio_html(portfolio_df: pd.DataFrame) -> str:
         </tbody>
     </table>
     """
-
 
 def build_full_table_html(df: pd.DataFrame) -> str:
     if df.empty:
