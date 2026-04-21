@@ -319,7 +319,10 @@ def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) 
     if portfolio.empty or signals.empty:
         return pd.DataFrame(), portfolio.copy()
 
-    current_prices = signals[["symbol", "name", "close", "prior_20_low", "status"]].copy()
+    current_prices = signals[
+        ["symbol", "name", "close", "prior_50_high", "prior_20_low", "status"]
+    ].copy()
+
     merged = portfolio.merge(current_prices, on=["symbol", "name"], how="left")
 
     if merged.empty:
@@ -330,6 +333,7 @@ def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) 
     merged["position_size"] = pd.to_numeric(merged["position_size"], errors="coerce")
     merged["stop_price_display"] = pd.to_numeric(merged["stop_price"], errors="coerce").round(PRICE_DECIMALS)
     merged["today_d20_display"] = pd.to_numeric(merged["prior_20_low"], errors="coerce").round(PRICE_DECIMALS)
+    merged["today_d50_display"] = pd.to_numeric(merged["prior_50_high"], errors="coerce").round(PRICE_DECIMALS)
 
     merged["updated_stop_price_display"] = merged.apply(
         lambda row: normalise_price(max(float(row["stop_price_display"]), float(row["today_d20_display"])))
@@ -355,6 +359,18 @@ def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) 
         else "",
         axis=1,
     )
+
+    # Score % for 50/20 live positions:
+    # (Current Price - Prior 50 High) / Prior 50 High * 100
+    merged["score_pct_raw"] = merged.apply(
+        lambda row: ((float(row["current_price_display"]) - float(row["today_d50_display"])) / float(row["today_d50_display"])) * 100
+        if pd.notna(row["current_price_display"]) and pd.notna(row["today_d50_display"]) and float(row["today_d50_display"]) != 0
+        else float("nan"),
+        axis=1,
+    )
+
+    # Highest score = rank 1
+    merged["rank"] = merged["score_pct_raw"].rank(ascending=False, method="dense")
 
     merged["entry_price_calc"] = merged.apply(
         lambda row: convert_price_for_cash_calcs(row["name"], float(row["entry_price_display"])),
@@ -383,6 +399,7 @@ def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) 
 
     value_cols = ["entry_value", "current_value", "stop_value", "pnl_total"]
     merged[value_cols] = merged[value_cols].round(PRICE_DECIMALS)
+    merged["score_pct_raw"] = merged["score_pct_raw"].round(2)
 
     updated_portfolio = merged[
         ["symbol", "name", "entry_price", "position_size", "entry_date", "updated_stop_price_display"]
@@ -399,9 +416,8 @@ def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) 
             "stop_price_display",
             "today_d20_display",
             "updated_stop_price_display",
-            "entry_value",
-            "current_value",
-            "stop_value",
+            "score_pct_raw",
+            "rank",
             "pnl_total",
             "pnl_pct",
             "stop_moved",
@@ -488,6 +504,16 @@ def format_portfolio_for_display(df: pd.DataFrame) -> pd.DataFrame:
             lambda x: f"{float(x):.2f}%" if pd.notna(x) else ""
         )
 
+    if "score_pct_raw" in formatted.columns:
+        formatted["score_pct_raw"] = formatted["score_pct_raw"].map(
+            lambda x: f"{float(x):.2f}%" if pd.notna(x) else ""
+        )
+
+    if "rank" in formatted.columns:
+        formatted["rank"] = formatted["rank"].map(
+            lambda x: f"{int(float(x))}" if pd.notna(x) else ""
+        )
+
     if "position_size" in formatted.columns:
         formatted["position_size"] = formatted["position_size"].map(
             lambda x: f"{int(x):,}" if pd.notna(x) else ""
@@ -519,7 +545,7 @@ def build_summary_html(
     exit_count = 0
 
     if not portfolio_df.empty:
-        total_current_value = float(portfolio_df["current_value"].sum())
+        # current_value no longer displayed in portfolio table, so calculate here from available fields if needed
         total_pnl = float(portfolio_df["pnl_total"].sum())
         open_positions = len(portfolio_df)
         stop_raise_count = int((portfolio_df["stop_moved"] == "RAISE STOP").sum())
@@ -553,9 +579,6 @@ def build_summary_html(
         </div>
         <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; font-weight: bold;">
             PORTFOLIO SELLS: {exit_count}
-        </div>
-        <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #e9ecef; color: #212529; border: 1px solid #ced4da; font-weight: bold;">
-            PORTFOLIO VALUE: £{total_current_value:,.2f}
         </div>
         <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: {pnl_bg}; color: {pnl_color}; border: 1px solid #ced4da; font-weight: bold;">
             TOTAL P&amp;L: £{total_pnl:,.2f}
@@ -634,25 +657,11 @@ def build_portfolio_html(portfolio_df: pd.DataFrame) -> str:
         <p style="margin: 0 0 24px 0;">No active positions in portfolio.csv.</p>
         """
 
-    working_df = portfolio_df.copy()
-
-    # 50/20 live positions: score is % distance from D50 breakout
-    working_df["score_pct_raw"] = (
-        (working_df["current_price"] - working_df["prior_50_high"]) / working_df["prior_50_high"]
-    ) * 100
-
-    # Highest score gets rank 1
-    working_df["rank"] = (
-        working_df["score_pct_raw"]
-        .rank(ascending=False, method="dense")
-        .astype(int)
-    )
-
-    formatted = format_portfolio_for_display(working_df)
+    formatted = format_portfolio_for_display(portfolio_df)
 
     rows = []
     for idx, row in formatted.iterrows():
-        raw_pnl = float(working_df.loc[idx, "pnl_total"])
+        raw_pnl = float(portfolio_df.loc[idx, "pnl_total"])
         pnl_bg = "#d4edda" if raw_pnl >= 0 else "#f8d7da"
         pnl_color = "#155724" if raw_pnl >= 0 else "#721c24"
 
@@ -663,9 +672,6 @@ def build_portfolio_html(portfolio_df: pd.DataFrame) -> str:
         exit_signal = row["exit_signal"]
         exit_bg = "#f8d7da" if exit_signal == "SELL" else "#ffffff"
         exit_color = "#721c24" if exit_signal == "SELL" else "#222222"
-
-        score_pct = f"{working_df.loc[idx, 'score_pct_raw']:.2f}%"
-        rank = int(working_df.loc[idx, "rank"])
 
         rows.append(f"""
         <tr>
@@ -678,8 +684,8 @@ def build_portfolio_html(portfolio_df: pd.DataFrame) -> str:
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['stop_price_display']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['today_d20_display']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['updated_stop_price_display']}</td>
-            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{score_pct}</td>
-            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{rank}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['score_pct_raw']}</td>
+            <td style="padding:10px; border:1px solid #ddd; text-align:right;">{row['rank']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right; background:{pnl_bg}; color:{pnl_color}; font-weight:bold;">{row['pnl_total']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:right; background:{pnl_bg}; color:{pnl_color}; font-weight:bold;">{row['pnl_pct']}</td>
             <td style="padding:10px; border:1px solid #ddd; text-align:center; background:{stop_bg}; color:{stop_color}; font-weight:bold;">{stop_moved}</td>
@@ -714,6 +720,7 @@ def build_portfolio_html(portfolio_df: pd.DataFrame) -> str:
         </tbody>
     </table>
     """
+
 
 def build_full_table_html(df: pd.DataFrame) -> str:
     if df.empty:
