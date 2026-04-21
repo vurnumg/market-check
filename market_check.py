@@ -545,7 +545,24 @@ def build_summary_html(
     exit_count = 0
 
     if not portfolio_df.empty:
-        # current_value no longer displayed in portfolio table, so calculate here from available fields if needed
+        # Recalculate portfolio value directly from displayed current price and size
+        portfolio_value_df = portfolio_df.copy()
+
+        portfolio_value_df["current_price_display"] = pd.to_numeric(
+            portfolio_value_df["current_price_display"], errors="coerce"
+        )
+        portfolio_value_df["position_size"] = pd.to_numeric(
+            portfolio_value_df["position_size"], errors="coerce"
+        )
+
+        portfolio_value_df["current_value_calc"] = portfolio_value_df.apply(
+            lambda row: convert_price_for_cash_calcs(row["name"], float(row["current_price_display"])) * float(row["position_size"])
+            if pd.notna(row["current_price_display"]) and pd.notna(row["position_size"])
+            else 0.0,
+            axis=1,
+        )
+
+        total_current_value = float(portfolio_value_df["current_value_calc"].sum())
         total_pnl = float(portfolio_df["pnl_total"].sum())
         open_positions = len(portfolio_df)
         stop_raise_count = int((portfolio_df["stop_moved"] == "RAISE STOP").sum())
@@ -579,6 +596,9 @@ def build_summary_html(
         </div>
         <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; font-weight: bold;">
             PORTFOLIO SELLS: {exit_count}
+        </div>
+        <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #e9ecef; color: #212529; border: 1px solid #ced4da; font-weight: bold;">
+            PORTFOLIO VALUE: £{total_current_value:,.2f}
         </div>
         <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: {pnl_bg}; color: {pnl_color}; border: 1px solid #ced4da; font-weight: bold;">
             TOTAL P&amp;L: £{total_pnl:,.2f}
