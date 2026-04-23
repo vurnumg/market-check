@@ -2,9 +2,12 @@ name: Daily Market Check
 
 on:
   schedule:
-    - cron: "50 16 * * 1-5"
+    - cron: "55 16 * * 1-5"
       timezone: "Europe/London"
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   run-market-check:
@@ -25,6 +28,14 @@ jobs:
 
       - name: Run market check
         run: python market_check.py
+
+      - name: Commit updated portfolio
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add portfolio.csv
+          git diff --cached --quiet || git commit -m "Update portfolio stops"
+          git push
 
       - name: Send email
         uses: dawidd6/action-send-mail@v6
