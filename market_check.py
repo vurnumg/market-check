@@ -51,7 +51,7 @@ WATCHLIST: Dict[str, str] = {
     "CMOD": "CMOD.L",
     "SGLN": "SGLN.L",
     "DTLA": "DTLA.L",
-    "GBUR": "GBEU.L",
+    "GBUR": "GBUR.L",
     "SMEA": "SMEA.L",
     "SJPA": "SJPA.L",
     "GBJP": "GBJP.L",
