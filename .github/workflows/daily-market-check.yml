@@ -2,7 +2,7 @@ name: Daily Market Check
 
 on:
   schedule:
-    - cron: "10 17 * * 1-5"
+    - cron: "50 16 * * 1-5"
       timezone: "Europe/London"
   workflow_dispatch:
 
