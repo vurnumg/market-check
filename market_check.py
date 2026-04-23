@@ -13,7 +13,6 @@ import yfinance as yf
 # -------------------------------
 RISK_PER_TRADE = 50.0  # Fixed £ risk per trade
 PORTFOLIO_FILE = "portfolio.csv"
-# UPDATED_PORTFOLIO_FILE = "portfolio_updated.csv"
 UPDATED_PORTFOLIO_FILE = "portfolio.csv"
 PRICE_DECIMALS = 2
 
@@ -36,6 +35,9 @@ PRICE_SCALE = {
     "GBJP": 0.01,
     "IBTM": 1.0,
 }
+
+# Yahoo symbols where the latest close can occasionally be returned in pence
+PENCE_ANOMALY_SYMBOLS = {"GBUS.L", "GBUR.L"}
 
 
 # -------------------------------
@@ -131,9 +133,9 @@ def download_ohlc(symbol: str, period: str = "18mo") -> pd.DataFrame:
 def apply_symbol_fixes(name: str, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # GBUS Yahoo anomaly fix:
+    # GBUS / GBUR Yahoo anomaly fix:
     # Sometimes only the latest close is shown in pence rather than dollars
-    if symbol == ["GBUS.L", "GBUR.L"]:
+    if symbol in PENCE_ANOMALY_SYMBOLS:
         last_close = df.iloc[-1]["Close"]
         recent_closes = df["Close"].iloc[-10:-1]
 
@@ -415,7 +417,7 @@ def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) 
 
     updated_portfolio = merged[
         ["symbol", "name", "entry_price", "position_size", "entry_date", "updated_stop_price_display"]
-    ].rename(columns={"updated_stop_price_display": "stop_price"})
+    ].rename(columns={"updated_stop_price_display": "stop_price"}).copy()
 
     portfolio_metrics = merged[
         [
@@ -442,13 +444,19 @@ def calculate_portfolio_metrics(portfolio: pd.DataFrame, signals: pd.DataFrame) 
 
 def save_updated_portfolio(updated_portfolio: pd.DataFrame) -> None:
     if updated_portfolio.empty:
+        print("No portfolio data to save.")
         return
 
     output_df = updated_portfolio.copy()
-    output_df["entry_price"] = output_df["entry_price"].map(lambda x: f"{float(x):.{PRICE_DECIMALS}f}")
-    output_df["position_size"] = output_df["position_size"].map(lambda x: int(float(x)))
-    output_df["stop_price"] = output_df["stop_price"].map(lambda x: f"{float(x):.{PRICE_DECIMALS}f}")
-    output_df.to_csv(UPDATED_PORTFOLIO_FILE, index=False)
+
+    output_df["entry_price"] = pd.to_numeric(output_df["entry_price"], errors="coerce").round(PRICE_DECIMALS)
+    output_df["position_size"] = pd.to_numeric(output_df["position_size"], errors="coerce").astype(int)
+    output_df["stop_price"] = pd.to_numeric(output_df["stop_price"], errors="coerce").round(PRICE_DECIMALS)
+
+    output_df.to_csv(UPDATED_PORTFOLIO_FILE, index=False, float_format=f"%.{PRICE_DECIMALS}f")
+
+    print(f"\nPortfolio saved to {UPDATED_PORTFOLIO_FILE}")
+    print(output_df.to_string(index=False))
 
 
 # -------------------------------
@@ -557,7 +565,6 @@ def build_summary_html(
     exit_count = 0
 
     if not portfolio_df.empty:
-        # Recalculate portfolio value directly from displayed current price and size
         portfolio_value_df = portfolio_df.copy()
 
         portfolio_value_df["current_price_display"] = pd.to_numeric(
@@ -603,7 +610,7 @@ def build_summary_html(
         <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #e9ecef; color: #212529; border: 1px solid #ced4da; font-weight: bold;">
             OPEN POSITIONS: {open_positions}
         </div>
-        <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #e9ecef; color: #212529; border: 1px solid #ced4da; font-weight: bold;">
+        <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #d4edda; color: #155724; border: 1px solid #c3e6cb; font-weight: bold;">
             STOPS RAISED: {stop_raise_count}
         </div>
         <div style="display: inline-block; margin: 0 12px 12px 0; padding: 12px 16px; background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; font-weight: bold;">
@@ -888,6 +895,17 @@ def main() -> None:
     if not portfolio_metrics_df.empty:
         print("\nPortfolio")
         print(format_portfolio_for_display(portfolio_metrics_df).to_string(index=False))
+
+        raised = portfolio_metrics_df[portfolio_metrics_df["stop_moved"] == "RAISE STOP"]
+        if not raised.empty:
+            print("\n=== STOPS RAISED ===")
+            print(raised[["name", "symbol", "stop_price_display", "updated_stop_price_display"]].to_string(index=False))
+        else:
+            print("\nNo stops raised today.")
+
+        print("\n=== UPDATED PORTFOLIO (TO BE SAVED) ===")
+        print(updated_portfolio_df.to_string(index=False))
+
         save_updated_portfolio(updated_portfolio_df)
         print(f"\nUpdated trailing stops written to {UPDATED_PORTFOLIO_FILE}")
     else:
