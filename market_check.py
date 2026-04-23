@@ -133,7 +133,7 @@ def apply_symbol_fixes(name: str, symbol: str, df: pd.DataFrame) -> pd.DataFrame
 
     # GBUS Yahoo anomaly fix:
     # Sometimes only the latest close is shown in pence rather than dollars
-    if symbol == "GBUS.L":
+    if symbol == ["GBUS.L", "GBUR.L"]:
         last_close = df.iloc[-1]["Close"]
         recent_closes = df["Close"].iloc[-10:-1]
 
