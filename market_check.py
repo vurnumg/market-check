@@ -29,6 +29,12 @@ PRICE_SCALE = {
     "GBUS": 1.0,
     "CMOD": 1.0,
     "SGLN": 1.0,
+    "DTLA": 1.0,
+    "GBEU": 1.0,
+    "SMEA": 0.01,
+    "SJPA": 0.01,
+    "GBJP": 0.01,
+    "IBTM": 1.0,
 }
 
 
@@ -44,6 +50,12 @@ WATCHLIST: Dict[str, str] = {
     "GBUS": "GBUS.L",
     "CMOD": "CMOD.L",
     "SGLN": "SGLN.L",
+    "DTLA": "DTLA.L",
+    "GBEU": "GBEU.L",
+    "SMEA": "SMEA.L",
+    "SJPA": "SJPA.L",
+    "GBJP": "GBJP.L",
+    "IBTM": "IBTM.L",
 }
 
 # Tickers that should use CLOSE-based channels
